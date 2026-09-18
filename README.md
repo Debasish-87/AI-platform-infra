@@ -33,26 +33,144 @@ for anything containerized without touching the infra.
   supports adding `staging`/`prod` later by copying the `dev` folder, but
   they aren't built here — no reason to carry infra nobody's using.
 
-## Architecture
+## Architecture — current (dev / learning grade)
 
 ```
-Developer
-   │  git push
-   ▼
-GitHub Actions
-   │
-   ├─ verify-infra   (fails fast if infra isn't ready — never builds/deploys blind)
-   │
-   ├─ build-and-push (pytest → Trivy scan → build → push to ECR)
-   │
-   └─ deploy         (manual approval gate → kubectl apply → rollout status)
-                          │
-                          ▼
-                    Amazon EKS (dev)
-                          │
-                          ▼
-                    sample-app (2 replicas, LoadBalancer Service)
+                              ┌──────────────────────┐
+                              │   GitHub Actions     │
+                              │  (OIDC, no static    │
+                              │   AWS keys)          │
+                              └──────────┬───────────┘
+                                         │
+                        verify → build+scan → deploy (1 manual approval)
+                                         │
+                                         ▼
+                    ┌─────────────────────────────────────────┐
+                    │         VPC (single account)            │
+                    │         2 AZs, 1 NAT Gateway            │
+                    │                                         │
+                    │  ┌───────────────┐   ┌───────────────┐  │
+                    │  │ Public Subnet │   │ Public Subnet │  │
+                    │  │   (AZ-a)      │   │   (AZ-b)      │  │
+                    │  └──────┬────────┘   └───────────────┘  │
+                    │         │ NAT (single, no HA)           │
+                    │  ┌──────▼────────┐   ┌───────────────┐  │
+                    │  │Private Subnet │   │Private Subnet │  │
+                    │  │   (AZ-a)      │   │   (AZ-b)      │  │
+                    │  │  EKS nodes    │   │  (unused)     │  │
+                    │  └───────────────┘   └───────────────┘  │
+                    └─────────────────────────────────────────┘
+                                         │
+                                         ▼
+                          EKS Cluster (single node group,
+                          t3.medium x2, no autoscaler)
+                                         │
+                                         ▼
+                    sample-app (2 replicas) → LoadBalancer Service
+                    (Classic ELB, public, no WAF, no TLS)
 ```
+
+This is one environment (`dev`), one AWS account, one NAT Gateway (a
+single point of failure), one fixed-size node group (no autoscaling), no
+TLS/WAF, and a single manual approval as the only deploy gate. That's a
+deliberate choice for a project whose point is demonstrating the infra
+layer cleanly — not a gap to be embarrassed about. See below for what
+changes if this needed to actually serve production traffic.
+
+## Architecture — production grade (not built here, documented for reference)
+
+```
+                        ┌───────────────────────────┐
+                        │      GitHub Actions       │
+                        │  OIDC + branch protection │
+                        │  + required PR reviews    │
+                        └──────────────┬────────────┘
+                                       │
+                verify → test → scan → build → push
+                                       │
+                    ┌──────────────────┴───────────────────┐
+                    ▼                                      ▼
+            Deploy to STAGING                     Deploy to PROD
+            (auto, on merge to main)         (manual gate + canary/blue-green)
+                    │                                      │
+                    ▼                                      ▼
+        ┌────────────────────────┐            ┌───────────────────────────┐
+        │  Staging AWS Account   │            │   Production AWS Account  │
+        │  (separate from prod)  │            │                           │
+        └────────────────────────┘            └─────────────┬─────────────┘
+                                                            │
+                                    ┌───────────────────────┴──────────────────────┐
+                                    │            VPC — 3 AZs                       │
+                                    │   NAT Gateway PER AZ (HA, no single point    │
+                                    │              of failure)                     │
+                                    │                                              │
+                                    │  Public (a/b/c)         Private (a/b/c)      │
+                                    │  ALB + WAF                EKS nodes          │
+                                    │       │                 (multi-node-group:   │
+                                    │       │                  system + app +      │
+                                    │       │                  spot/on-demand mix) │
+                                    └───────┼──────────────────────┬───────────────┘
+                                            │                      │
+                                            ▼                      ▼
+                                    ┌───────────────┐    ┌──────────────────────┐
+                                    │  AWS WAF      │    │ Cluster Autoscaler / │
+                                    │  (rate limit, │    │ Karpenter            │
+                                    │   bot rules)  │    │ (scale on demand)    │
+                                    └───────┬───────┘    └──────────────────────┘
+                                            │
+                                    ┌───────▼────────┐
+                                    │ ALB Ingress    │
+                                    │ Controller     │
+                                    │ + cert-manager │
+                                    │ (TLS, ACM)     │
+                                    └───────┬────────┘
+                                            │
+                        ┌───────────────────┼────────────────────┐
+                        ▼                   ▼                    ▼
+                ┌───────────────┐   ┌───────────────┐    ┌────────────────┐
+                │ sample-app    │   │ HPA           │    │ Pod Disruption │
+                │ (N replicas,  │   │ (auto-scale   │    │ Budget         │
+                │ pod anti-     │   │  on CPU/mem)  │    │ (min available)│
+                │ affinity)     │   └───────────────┘    └────────────────┘
+                └───────────────┘
+
+        Cross-cutting (all namespaces):
+        ├── Network Policies (default-deny, explicit allow)
+        ├── Pod Security Standards (restricted)
+        ├── OPA/Kyverno policies (image provenance, no :latest, resource limits required)
+        ├── External Secrets Operator → AWS Secrets Manager (properly wired, not a stub)
+        ├── Centralized logging → CloudWatch Logs / OpenSearch
+        ├── Prometheus + Grafana + Alertmanager (paging on-call)
+        ├── Velero → scheduled EKS backups to S3
+        └── Cost tagging + AWS Budgets alerts per environment
+```
+
+### Dev → production upgrade table
+
+| Area | Dev (current) | Production (proposed) |
+|---|---|---|
+| AWS accounts | 1 account, 1 env | Separate accounts per env (dev/staging/prod) — blast-radius isolation |
+| AZs | 2 | 3 (EKS best practice, better failure tolerance) |
+| NAT Gateway | 1 (single point of failure) | 1 per AZ (HA) |
+| Node scaling | Fixed 2 nodes, manual | Cluster Autoscaler / Karpenter, multiple node groups (system vs app, spot mix for cost) |
+| Ingress | Raw LoadBalancer Service, HTTP only | ALB Ingress Controller + WAF + TLS via cert-manager/ACM |
+| Deploy strategy | Direct rolling update | Canary or blue-green, automated staging + gated prod |
+| Secrets | Plain Kubernetes Secrets | External Secrets Operator → AWS Secrets Manager |
+| Network security | None (flat pod network) | Network Policies (default-deny), Pod Security Standards |
+| Policy enforcement | None | OPA/Kyverno — block `:latest` tags, unscanned images, missing resource limits |
+| Logging | Pod logs via `kubectl logs` only | Centralized (CloudWatch/OpenSearch), retained + searchable |
+| Alerting | None | Alertmanager → PagerDuty/Slack, real on-call paging |
+| Backup/DR | None | Velero scheduled backups, tested restore runbook |
+| CI/CD gates | 1 manual approval | Branch protection + required reviews + staging auto-deploy + prod manual gate |
+| Cost control | None | Budgets + alerts, spot for non-critical node pools |
+
+Production topology costs meaningfully more to run (multiple NAT
+Gateways, a second AWS account, WAF, extra controllers) — roughly 2-3x
+this project's baseline if left running continuously. That trade-off is
+why this repo intentionally stays at the dev-grade architecture: it's
+enough to demonstrate the infra layer correctly without paying for
+capacity nobody's using. Treat the table above as the actual next-steps
+list if this ever needs to hold production traffic.
 
 ## What's actually here
 
