@@ -1,0 +1,11 @@
+scan:
+  skip-dirs:
+    - tests
+
+vulnerability:
+  severity:
+    - HIGH
+    - CRITICAL
+
+report:
+  format: table

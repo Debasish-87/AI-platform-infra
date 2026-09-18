@@ -1,0 +1,145 @@
+name: Deploy Sample App
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "requirements.txt"
+      - "docker/**"
+      - "kubernetes/base/**"
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write   # required for AWS OIDC
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  CLUSTER_NAME: ai-platform-infra-dev
+  ECR_REPO_NAME: sample-app
+
+jobs:
+  # -----------------------------------------------------------------
+  # Gate 1: infra must already exist and be healthy (it's created
+  # manually via scripts/setup-infra.sh, never by CI). If this fails,
+  # the job fails immediately and nothing downstream runs.
+  # -----------------------------------------------------------------
+  verify-infra:
+    name: Verify infra is set up correctly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Run strict infra check
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+          CLUSTER_NAME: ${{ env.CLUSTER_NAME }}
+        run: ./scripts/ci-check-infra.sh
+
+  # -----------------------------------------------------------------
+  # Gate 2: only runs if verify-infra passed. Tests, scans, builds,
+  # pushes.
+  # -----------------------------------------------------------------
+  build-and-push:
+    name: Test, scan, build, push
+    needs: verify-infra
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.image.outputs.uri }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          IMAGE_TAG="${GITHUB_SHA::12}"
+          IMAGE_URI="${REGISTRY}/${ECR_REPO_NAME}:${IMAGE_TAG}"
+          docker build -f docker/Dockerfile -t "${IMAGE_URI}" .
+          echo "IMAGE_URI=${IMAGE_URI}" >> "$GITHUB_ENV"
+
+      - name: Trivy security scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE_URI }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+
+      - name: Push image
+        id: image
+        run: |
+          docker push "${IMAGE_URI}"
+          echo "uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+  # -----------------------------------------------------------------
+  # Gate 3: manual approval via the "production" GitHub Environment
+  # (Settings > Environments > required reviewer). Only runs if
+  # build-and-push succeeded.
+  # -----------------------------------------------------------------
+  deploy:
+    name: Deploy to EKS
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Connect to EKS
+        run: aws eks update-kubeconfig --region "${AWS_REGION}" --name "${CLUSTER_NAME}"
+
+      - name: Deploy
+        env:
+          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
+        run: |
+          kubectl apply -f kubernetes/base/namespace.yaml
+          envsubst < kubernetes/base/deployment.yaml | kubectl apply -f -
+          kubectl apply -f kubernetes/base/service.yaml
+          kubectl rollout status deployment/sample-app -n sample-app --timeout=180s
+
+      - name: Show Load Balancer
+        run: |
+          kubectl get service sample-app -n sample-app \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || true

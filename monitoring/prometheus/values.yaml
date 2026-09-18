@@ -1,0 +1,13 @@
+grafana:
+  enabled: false
+
+alertmanager:
+  enabled: false
+
+prometheus:
+  prometheusSpec:
+    retention: 7d
+
+    scrapeInterval: 30s
+
+    evaluationInterval: 30s

@@ -1,0 +1,18 @@
+adminUser: admin
+
+adminPassword: admin123
+
+service:
+  type: ClusterIP
+
+persistence:
+  enabled: true
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+
+  limits:
+    cpu: 500m
+    memory: 512Mi
